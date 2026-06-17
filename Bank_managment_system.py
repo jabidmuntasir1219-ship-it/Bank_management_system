@@ -291,7 +291,7 @@ def log_transaction(account_no: str, t_type: str, amount: float) -> None:
 # ---------------------------------------------------------------------------
 # MUDARABAH ENGINE
 # ---------------------------------------------------------------------------
-def calculate_bank_total_profit() -> tuple[float, float, float]:
+def calculate_bank_total_profit(flush: bool = True) -> tuple[float, float, float]:
     """
     Reads the transactions ledger to compute the bank's P&L.
 
@@ -308,7 +308,30 @@ def calculate_bank_total_profit() -> tuple[float, float, float]:
                      forward-compatibility if a provisional rate is added)
 
     Net Profit    = Total Revenue - Total Cost
+
+    NOTE: Before aggregating from the transactions table, all accounts are
+    flushed through apply_accrued_interest() so that any real-time interest
+    that has accumulated since the last operation is committed to the DB
+    first. Without this step, accounts that have not been touched recently
+    would have unwritten accruals that are invisible to the SQL SUM queries,
+    causing the Mudarabah pool to be under-calculated.
     """
+    # ── FLUSH: force all pending accruals into the DB before aggregating ──────
+    # Guarded by flush=True so refresh() can pass flush=False and skip this
+    # block — refresh() already flushes all accounts in its own loop above,
+    # so running it again here would create the cycle:
+    #   refresh → apply_accrued_interest → calculate_bank_total_profit
+    #          → apply_accrued_interest → ... (RecursionError)
+    if flush:
+        with sqlite3.connect(DB_NAME) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT account_no FROM accounts")
+            all_account_nos = [row[0] for row in cur.fetchall()]
+
+        for account_no in all_account_nos:
+            apply_accrued_interest(account_no)
+    # ── END FLUSH ─────────────────────────────────────────────────────────────
+
     with sqlite3.connect(DB_NAME) as conn:
         cur = conn.cursor()
 
@@ -321,18 +344,23 @@ def calculate_bank_total_profit() -> tuple[float, float, float]:
         total_revenue = cur.fetchone()[0]
 
         # Cost: conventional savings interest credited to depositors
+        # AND amount > 0 guards against anomalous negative entries that
+        # would artificially reduce expenses and inflate the profit pool.
         cur.execute("""
             SELECT COALESCE(SUM(amount), 0.0)
             FROM transactions
             WHERE type LIKE 'Auto Interest Accrual%'
+              AND amount > 0
         """)
         conventional_cost = cur.fetchone()[0]
 
         # Cost: any provisional Shariah profit credited (currently 0)
+        # AND amount > 0 applied consistently for the same reason.
         cur.execute("""
             SELECT COALESCE(SUM(amount), 0.0)
             FROM transactions
             WHERE type LIKE 'Auto Halal Profit Accrual%'
+              AND amount > 0
         """)
         shariah_provisional_cost = cur.fetchone()[0]
 
@@ -362,7 +390,8 @@ def calculate_and_distribute_mudarabah() -> dict:
     Returns a result dict describing the full P&L and per-account payouts,
     or an error/info string if distribution cannot proceed.
     """
-    total_revenue, total_cost, net_profit = calculate_bank_total_profit()
+    # Fix: Explicitly pass flush=True to ensure real-time accruals are calculated before Mudarabah sharing
+    total_revenue, total_cost, net_profit = calculate_bank_total_profit(flush=True)
 
     if net_profit <= 0:
         return {
@@ -452,6 +481,20 @@ def calculate_and_distribute_mudarabah() -> dict:
                 "payout":        customer_payout,
             })
 
+        # ── SETTLEMENT UPDATE: settle all accrual rows so they are excluded from
+        # the next distribution cycle's SUM queries. Rows prefixed with
+        # '[Settled] ' no longer match the LIKE 'Auto %' patterns, so
+        # the profit baseline resets to 0 for the next period.
+        # The AND NOT LIKE guard makes this UPDATE idempotent.
+        cur.execute("""
+            UPDATE transactions
+            SET    type = '[Settled] ' || type
+            WHERE  (   type LIKE 'Auto Loan Interest Accrual%'
+                    OR type LIKE 'Auto Interest Accrual%'
+                    OR type LIKE 'Auto Halal Profit Accrual%')
+              AND  type NOT LIKE '[Settled]%'
+        """)
+        
         conn.commit()
 
     return {
@@ -971,7 +1014,8 @@ class BankManagerApp:
 
         def preview():
             """Show P&L and projected distribution WITHOUT committing to DB."""
-            total_revenue, total_cost, net_profit = calculate_bank_total_profit()
+            # Fix: Explicitly pass flush=False to prevent recursive loops from preview calls
+            total_revenue, total_cost, net_profit = calculate_bank_total_profit(flush=False)
 
             lines = [
                 "=" * 60,
@@ -1050,7 +1094,7 @@ class BankManagerApp:
 
         def distribute():
             """Run the full distribution and commit to DB."""
-            _, _, net_profit = calculate_bank_total_profit()
+            _, _, net_profit = calculate_bank_total_profit(flush=False) # Only to check early conditions
             if net_profit <= 0:
                 messagebox.showwarning("No Profit",
                     "Bank net profit is zero or negative.\n"
@@ -1125,6 +1169,12 @@ class BankManagerApp:
                 f"  Accounts Paid    : {len(d['distributions'])}\n"
                 f"  Bank Retained    : {d['bank_share']:,.2f} BDT",
                 parent=win)
+
+            # Issue 1 FIX: refresh the panel immediately after distribution
+            # so the text display reflects the now-settled (empty) pool.
+            # This prevents stale pre-distribution numbers from remaining
+            # on screen and blocks accidental double-clicks on the button.
+            preview()
 
         # ── button row ────────────────────────────────────────────────────────
         btn_row = tk.Frame(win, bg="white")
@@ -1241,7 +1291,10 @@ class BankManagerApp:
             # Stats bar
             for w in stats_frame.winfo_children():
                 w.destroy()
-            total_revenue, total_cost, net_profit = calculate_bank_total_profit()
+                
+            # Fix: Explicitly pass flush=False to sever the recursion cycle between refresh and accrual
+            total_revenue, total_cost, net_profit = calculate_bank_total_profit(flush=False)
+            
             stats = [
                 ("Total Accounts",    str(len(account_nos))),
                 ("Total Deposits",    f"{total_balance:,.2f} BDT"),
