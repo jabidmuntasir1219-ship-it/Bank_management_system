@@ -201,9 +201,7 @@ The app includes validation for:
 
 ## Screenshots
 
-Add screenshots here after running the app:
-
-- Main Menu
+![Main Menu](project\Screenshot 2026-06-17 160540.png)
 - Account Creation
 - Deposit Window
 - Withdraw Window
