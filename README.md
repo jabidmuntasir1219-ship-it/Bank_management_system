@@ -298,7 +298,7 @@ Interested in Machine Learning, Competitive Programming, and Software Developmen
 
 ## License
 
-You may add a license of your choice, such as MIT.
+**MIT license**
 
 ---
 
