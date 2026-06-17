@@ -199,26 +199,6 @@ The app includes validation for:
 
 ---
 
-## Screenshots
-
-![Main Menu](project\Screenshot 2026-06-17 160540.png)
-- Account Creation
-- Deposit Window
-- Withdraw Window
-- Account Dashboard
-- Loan Management
-- Mudarabah Panel
-- Admin Portal
-
-Example:
-
-```md
-
-
-
-```
-
----
 
 ## Installation
 
