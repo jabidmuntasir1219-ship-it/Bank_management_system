@@ -33,6 +33,9 @@ RETAINED_EARNINGS_RATE   = 0.80     # 80% of bank's share → retained earnings
 ANNUAL_SHARIAH_PROVISIONAL = 0.00   # 0% — no provisional credit; real profit
                                      # is distributed via Mudarabah calculation
 
+# Minimum deposit amount for any subsequent deposit (after account creation)
+MIN_DEPOSIT_AMOUNT        = 10.0    # 10 BDT minimum per deposit transaction
+
 
 # ---------------------------------------------------------------------------
 # DATABASE INITIALISATION
@@ -48,7 +51,9 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
     acc_cols = {row[1] for row in cur.fetchall()}
 
     if "username" in acc_cols and "account_no" not in acc_cols:
-        cur.executescript("""
+        # Use local time instead of SQLite's UTC datetime('now')
+        now_str = _now_str()
+        cur.executescript(f"""
             PRAGMA foreign_keys = OFF;
             CREATE TABLE IF NOT EXISTS accounts_new (
                 account_no   TEXT PRIMARY KEY,
@@ -66,7 +71,7 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
                    COALESCE(mobile,''), COALESCE(nid,username),
                    COALESCE(account_type,'Conventional'),
                    COALESCE(balance,0.0), COALESCE(loan,0.0),
-                   COALESCE(last_update,datetime('now'))
+                   COALESCE(last_update,'{now_str}')
             FROM accounts;
             DROP TABLE accounts;
             ALTER TABLE accounts_new RENAME TO accounts;
@@ -200,7 +205,7 @@ def apply_accrued_interest(account_no: str) -> dict | None:
                            Real profit is distributed by calculate_and_distribute_mudarabah().
                            last_update is still refreshed so time doesn't accumulate.
 
-    Loan interest (Conventional only): accrued on outstanding loan balance.
+    Loan interest (Conventional only): accrued on outstanding loan balance using SIMPLE INTEREST.
     """
     with sqlite3.connect(DB_NAME) as conn:
         cur = conn.cursor()
@@ -229,9 +234,9 @@ def apply_accrued_interest(account_no: str) -> dict | None:
         loan_interest  = 0.0
         t_entries      = []
 
-        if months_passed > 0.0001:
+        if months_passed > 0.0:
 
-            # ── Conventional savings interest (bank's cost) ───────────────────
+            # ── Conventional savings interest (compound) ─────────────────────
             if ac_type == "Conventional" and balance > 0.0:
                 monthly_rate   = ANNUAL_SAVINGS_RATE / 12
                 new_balance    = balance * ((1 + monthly_rate) ** months_passed)
@@ -245,16 +250,16 @@ def apply_accrued_interest(account_no: str) -> dict | None:
             # (ANNUAL_SHARIAH_PROVISIONAL = 0.0, so nothing is added here)
 
             # ── Loan interest (Conventional only, bank's revenue) ─────────────
+            # SIMPLE INTEREST: loan_interest = principal * monthly_rate * months_passed
             if loan > 0.0 and ac_type == "Conventional":
                 loan_monthly_rate = ANNUAL_LOAN_RATE / 12
-                new_loan          = loan * ((1 + loan_monthly_rate) ** months_passed)
-                loan_interest     = new_loan - loan
+                loan_interest = loan * loan_monthly_rate * months_passed
                 l_label = f"Auto Loan Interest Accrual ({months_passed:.4f} mo)"
                 if round(loan_interest, 2) >= 0.01:
                     t_entries.append((account_no, l_label,
                                       round(loan_interest, 4), now_s))
 
-        # Always refresh last_update
+        # Always refresh last_update using a single atomic UPDATE
         cur.execute(
             "UPDATE accounts "
             "SET balance = balance + ?, loan = loan + ?, last_update = ? "
@@ -298,14 +303,11 @@ def calculate_bank_total_profit(flush: bool = True) -> tuple[float, float, float
     Returns (total_revenue, total_cost, net_profit) — all in BDT.
 
     Total Revenue = SUM of all 'Auto Loan Interest Accrual' rows
-                    (interest the bank EARNED from borrowers)
-
+                    (interest the bank EARNED from borrowers) — including settled ones.
     Total Cost    = SUM of all 'Auto Interest Accrual' rows
-                    (conventional savings interest the bank PAID out)
+                    (conventional savings interest the bank PAID out) — including settled ones.
                   + SUM of all 'Auto Halal Profit Accrual' rows
-                    (any provisional Shariah profit paid out — currently 0
-                     since ANNUAL_SHARIAH_PROVISIONAL = 0, but kept for
-                     forward-compatibility if a provisional rate is added)
+                    (any provisional Shariah profit paid out — currently 0).
 
     Net Profit    = Total Revenue - Total Cost
 
@@ -335,31 +337,30 @@ def calculate_bank_total_profit(flush: bool = True) -> tuple[float, float, float
     with sqlite3.connect(DB_NAME) as conn:
         cur = conn.cursor()
 
-        # Revenue: loan interest charged to borrowers
+        # Revenue: loan interest charged to borrowers (including settled)
         cur.execute("""
             SELECT COALESCE(SUM(amount), 0.0)
             FROM transactions
-            WHERE type LIKE 'Auto Loan Interest Accrual%'
+            WHERE type LIKE '%Auto Loan Interest Accrual%'
         """)
         total_revenue = cur.fetchone()[0]
 
-        # Cost: conventional savings interest credited to depositors
+        # Cost: conventional savings interest credited to depositors (including settled)
         # AND amount > 0 guards against anomalous negative entries that
         # would artificially reduce expenses and inflate the profit pool.
         cur.execute("""
             SELECT COALESCE(SUM(amount), 0.0)
             FROM transactions
-            WHERE type LIKE 'Auto Interest Accrual%'
+            WHERE type LIKE '%Auto Interest Accrual%'
               AND amount > 0
         """)
         conventional_cost = cur.fetchone()[0]
 
-        # Cost: any provisional Shariah profit credited (currently 0)
-        # AND amount > 0 applied consistently for the same reason.
+        # Cost: any provisional Shariah profit credited (currently 0) (including settled)
         cur.execute("""
             SELECT COALESCE(SUM(amount), 0.0)
             FROM transactions
-            WHERE type LIKE 'Auto Halal Profit Accrual%'
+            WHERE type LIKE '%Auto Halal Profit Accrual%'
               AND amount > 0
         """)
         shariah_provisional_cost = cur.fetchone()[0]
@@ -416,6 +417,7 @@ def calculate_and_distribute_mudarabah() -> dict:
     # Note: statutory_reserve + retained_earnings = bank_share exactly (no residual)
 
     # ── Fetch all Shariah accounts and their current balances ─────────────────
+    # Use a single connection for all operations to avoid locking
     with sqlite3.connect(DB_NAME) as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -425,32 +427,30 @@ def calculate_and_distribute_mudarabah() -> dict:
         """)
         shariah_accounts = cur.fetchall()   # [(account_no, name, balance), ...]
 
-    if not shariah_accounts:
-        return {
-            "status":             "no_shariah_accounts",
-            "total_revenue":      total_revenue,
-            "total_cost":         total_cost,
-            "net_profit":         net_profit,
-            "mudarabah_pool":     mudarabah_pool,
-            "bank_share":         bank_share,
-            "statutory_reserve":  statutory_reserve,
-            "retained_earnings":  retained_earnings,
-            "distributions":      [],
-            "message":            (
-                "No active Shariah accounts found. "
-                "Mudarabah pool of "
-                f"{mudarabah_pool:,.2f} BDT cannot be distributed."
-            )
-        }
+        if not shariah_accounts:
+            return {
+                "status":             "no_shariah_accounts",
+                "total_revenue":      total_revenue,
+                "total_cost":         total_cost,
+                "net_profit":         net_profit,
+                "mudarabah_pool":     mudarabah_pool,
+                "bank_share":         bank_share,
+                "statutory_reserve":  statutory_reserve,
+                "retained_earnings":  retained_earnings,
+                "distributions":      [],
+                "message":            (
+                    "No active Shariah accounts found. "
+                    "Mudarabah pool of "
+                    f"{mudarabah_pool:,.2f} BDT cannot be distributed."
+                )
+            }
 
-    total_shariah_balance = sum(row[2] for row in shariah_accounts)
+        total_shariah_balance = sum(row[2] for row in shariah_accounts)
 
-    # ── Pro-rata distribution & DB update ────────────────────────────────────
-    distributions = []
-    now_s = _now_str()
+        # ── Pro-rata distribution & DB update ────────────────────────────────────
+        distributions = []
+        now_s = _now_str()
 
-    with sqlite3.connect(DB_NAME) as conn:
-        cur = conn.cursor()
         for acc_no, name, bal in shariah_accounts:
             share_ratio   = bal / total_shariah_balance
             customer_payout = round(mudarabah_pool * share_ratio, 2)
@@ -531,6 +531,9 @@ class BankManagerApp:
         self.root.config(bg=self.BG)
         self.root.resizable(False, False)
         _center_window(self.root, 460, 590)
+
+        # Store a reference to the admin dashboard refresh function
+        self.admin_dashboard_refresh = None
 
         tk.Label(root, text="🏛  BANK MANAGEMENT SYSTEM",
                  font=self.TITLE_FONT, bg=self.BG, fg=self.ACCENT).pack(pady=(28, 4))
@@ -616,9 +619,11 @@ class BankManagerApp:
             mode   = ("Conventional" if "Conventional" in cmb_type.get()
                       else "Shariah")
 
-            if not name or len(name) < 3:
+            # Name must contain only alphabetic characters and spaces
+            if not name or len(name) < 3 or not all(c.isalpha() or c.isspace() for c in name):
                 messagebox.showerror("Validation Error",
-                    "Full name must be at least 3 characters.", parent=win)
+                    "Full name must be at least 3 characters and contain only letters and spaces.",
+                    parent=win)
                 return
             if not _validate_mobile(mobile):
                 messagebox.showerror("Validation Error",
@@ -650,10 +655,13 @@ class BankManagerApp:
                         return
 
                     acc_no = _generate_account_no()
+                    # Explicitly list all columns including loan to avoid ambiguity
                     cur.execute(
-                        "INSERT INTO accounts VALUES (?,?,?,?,?,?,?,?)",
+                        "INSERT INTO accounts (account_no, name, mobile, nid, account_type, balance, loan, last_update) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (acc_no, name, mobile, nid, mode,
-                         dep_amount, 0.0, _now_str()))
+                         dep_amount, 0.0, _now_str())
+                    )
                     conn.commit()
 
                 log_transaction(acc_no, "Account Opening Deposit", dep_amount)
@@ -681,7 +689,7 @@ class BankManagerApp:
                  bg="white", fg=self.ACCENT).pack(pady=(16, 8))
         self._lbl(win, "Account Number")
         ent_user = self._entry(win)
-        self._lbl(win, "Deposit Amount (BDT)")
+        self._lbl(win, f"Deposit Amount (BDT, min {MIN_DEPOSIT_AMOUNT:.0f})")
         ent_amount = self._entry(win)
 
         def proceed():
@@ -699,6 +707,11 @@ class BankManagerApp:
                 messagebox.showerror("Error",
                     "Enter a valid positive amount.", parent=win)
                 return
+            if amount < MIN_DEPOSIT_AMOUNT:
+                messagebox.showerror("Amount Too Small",
+                    f"Minimum deposit amount is {MIN_DEPOSIT_AMOUNT:.0f} BDT.",
+                    parent=win)
+                return
             try:
                 with sqlite3.connect(DB_NAME) as conn:
                     conn.execute(
@@ -706,9 +719,16 @@ class BankManagerApp:
                         "WHERE account_no = ?", (amount, user))
                     conn.commit()
                 log_transaction(user, "Deposit", amount)
+
+                # Fetch the true current balance after the update
+                with sqlite3.connect(DB_NAME) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT balance FROM accounts WHERE account_no = ?", (user,))
+                    new_balance = cur.fetchone()[0]
+
                 messagebox.showinfo("Success",
                     f"✅ Deposited {amount:.2f} BDT\n"
-                    f"New Balance : {acc['balance'] + amount:.2f} BDT",
+                    f"New Balance : {new_balance:.2f} BDT",
                     parent=win)
                 win.destroy()
             except Exception as e:
@@ -756,9 +776,16 @@ class BankManagerApp:
                         "WHERE account_no = ?", (amount, user))
                     conn.commit()
                 log_transaction(user, "Withdrawal", amount)
+
+                # Fetch the true current balance after the update
+                with sqlite3.connect(DB_NAME) as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT balance FROM accounts WHERE account_no = ?", (user,))
+                    new_balance = cur.fetchone()[0]
+
                 messagebox.showinfo("Success",
                     f"✅ Withdrawn {amount:.2f} BDT\n"
-                    f"Remaining Balance : {acc['balance'] - amount:.2f} BDT",
+                    f"Remaining Balance : {new_balance:.2f} BDT",
                     parent=win)
                 win.destroy()
             except Exception as e:
@@ -1162,19 +1189,21 @@ class BankManagerApp:
             txt.insert(tk.END, "\n".join(lines))
             txt.config(state="disabled")
 
-            messagebox.showinfo("Distribution Complete",
-                f"✅ Mudarabah profit distributed successfully!\n\n"
-                f"  Net Profit       : {d['net_profit']:,.2f} BDT\n"
-                f"  Customer Pool    : {d['mudarabah_pool']:,.2f} BDT\n"
-                f"  Accounts Paid    : {len(d['distributions'])}\n"
-                f"  Bank Retained    : {d['bank_share']:,.2f} BDT",
-                parent=win)
+            # Removed duplicate messagebox call – only the rich text output remains.
 
-            # Issue 1 FIX: refresh the panel immediately after distribution
-            # so the text display reflects the now-settled (empty) pool.
-            # This prevents stale pre-distribution numbers from remaining
-            # on screen and blocks accidental double-clicks on the button.
-            preview()
+            # Trigger admin dashboard refresh if it exists
+            if self.admin_dashboard_refresh is not None:
+                try:
+                    self.admin_dashboard_refresh()
+                    # Force UI update to reflect new data immediately
+                    if hasattr(self, 'root'):
+                        self.root.update_idletasks()
+                except Exception:
+                    # Dashboard may have been closed; ignore
+                    self.admin_dashboard_refresh = None
+
+            # Do NOT call preview() here — it would show a stale "no profit" state.
+            # The distribution result is already displayed above.
 
         # ── button row ────────────────────────────────────────────────────────
         btn_row = tk.Frame(win, bg="white")
@@ -1259,7 +1288,22 @@ class BankManagerApp:
         tree.tag_configure("odd",  background="#f9f9f9")
         tree.tag_configure("even", background="white")
 
+        # --- Timer management to prevent duplicate after() loops ---
+        timer_id = None
+
+        def schedule_auto():
+            nonlocal timer_id
+            if timer_id is not None:
+                dash.after_cancel(timer_id)
+            timer_id = dash.after(10000, _auto_refresh)
+
+        def _auto_refresh():
+            if dash.winfo_exists():
+                refresh()
+            # schedule_auto will be called inside refresh()
+
         def refresh():
+            nonlocal timer_id
             for item in tree.get_children():
                 tree.delete(item)
             try:
@@ -1312,6 +1356,12 @@ class BankManagerApp:
                          font=("Segoe UI", 11, "bold"),
                          bg="#ecf0f1", fg=color).pack()
 
+            # Schedule next auto-refresh (cancels any pending timer)
+            schedule_auto()
+
+        # Store the refresh function for external calls (e.g., Mudarabah distribution)
+        self.admin_dashboard_refresh = refresh
+
         ctrl_frame = tk.Frame(dash, bg="white")
         ctrl_frame.pack(fill="x", padx=14, pady=(0, 10))
         tk.Button(ctrl_frame, text="🔄  Refresh Data", command=refresh,
@@ -1319,15 +1369,35 @@ class BankManagerApp:
                   font=(self.BUTTON_FONT[0], 9, "bold"),
                   bd=0, padx=10, pady=5, cursor="hand2").pack(side="left")
 
-        refresh()
+        # Clean up timer and reference when window is closed
+        def on_close():
+            nonlocal timer_id
+            if timer_id is not None:
+                dash.after_cancel(timer_id)
+            self.admin_dashboard_refresh = None
+            dash.destroy()
+        dash.protocol("WM_DELETE_WINDOW", on_close)
+
+        refresh()          # initial load (also starts auto-refresh)
 
     @staticmethod
     def _sort_treeview(tree: ttk.Treeview, col: str, reverse: bool) -> None:
         data = [(tree.set(k, col), k) for k in tree.get_children("")]
+        # If the treeview is empty, nothing to sort.
+        if not data:
+            return
         try:
-            data.sort(key=lambda x: float(x[0].replace(",", "")),
-                      reverse=reverse)
-        except ValueError:
+            # Extract numeric part: remove non-digit/non-decimal characters
+            import re
+            clean = re.sub(r'[^\d.]', '', data[0][0]) if data[0][0] else ''
+            # If clean is empty, fall back to string sort later
+            if clean:
+                data.sort(key=lambda x: float(re.sub(r'[^\d.]', '', x[0])),
+                          reverse=reverse)
+            else:
+                data.sort(reverse=reverse)
+        except (ValueError, IndexError):
+            # Fallback to alphabetical sorting if conversion fails
             data.sort(reverse=reverse)
         for index, (_, k) in enumerate(data):
             tree.move(k, "", index)
